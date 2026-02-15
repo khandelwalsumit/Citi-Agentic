@@ -99,18 +99,18 @@ def _make_agent_node(
             )
 
     if agent_tools:
-        react_agent = create_react_agent(
-            llm,
-            tools=agent_tools,
-            state_modifier=skill.system_prompt,
-        )
+        react_agent = create_react_agent(llm, tools=agent_tools)
+        system_msg = SystemMessage(content=skill.system_prompt)
 
         def tool_agent_node(state: AgentState) -> dict:
             if tracer:
                 tracer.start(skill.name, _summarize_messages(state["messages"]))
             try:
-                result = react_agent.invoke({"messages": state["messages"]})
-                input_len = len(state["messages"])
+                # Prepend system prompt — CitiVertexChat._generate handles it
+                input_msgs = [system_msg] + state["messages"]
+                result = react_agent.invoke({"messages": input_msgs})
+                # +1 for the system_msg we prepended
+                input_len = len(state["messages"]) + 1
                 new_messages = result["messages"][input_len:]
 
                 # Log tool calls to tracer
@@ -317,11 +317,24 @@ def build_single_agent(
     ]
 
     if agent_tools:
-        return create_react_agent(
-            llm,
-            tools=agent_tools,
-            state_modifier=skill.system_prompt,
-        )
+        react_agent = create_react_agent(llm, tools=agent_tools)
+        sys_msg = SystemMessage(content=skill.system_prompt)
+
+        # Wrap to inject system prompt into messages
+        from langgraph.graph import MessagesState as _MS
+
+        def call_react(state: _MS):
+            result = react_agent.invoke({
+                "messages": [sys_msg] + state["messages"],
+            })
+            # Strip the prepended system msg from output
+            return {"messages": result["messages"][len(state["messages"]) + 1:]}
+
+        g = StateGraph(_MS)
+        g.add_node("agent", call_react)
+        g.set_entry_point("agent")
+        g.add_edge("agent", END)
+        return g.compile()
     else:
         from langgraph.graph import MessagesState
 
