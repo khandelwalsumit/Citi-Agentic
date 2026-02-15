@@ -1,5 +1,3 @@
-check below code 
-
 ```python
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -178,7 +176,33 @@ class VertexAILLM(BaseChatModel):
                 if message.content:
                     parts.append(Part.from_text(message.content))
                 # Preserve prior assistant tool calls so Vertex can continue correctly.
+                normalized_tool_calls: List[Dict[str, Any]] = []
                 for tc in getattr(message, "tool_calls", []) or []:
+                    normalized_tool_calls.append(
+                        {
+                            "id": tc.get("id"),
+                            "name": tc.get("name"),
+                            "args": tc.get("args", {}),
+                        }
+                    )
+                # Backward-compat: some stacks store OpenAI-style tool_calls in additional_kwargs.
+                if not normalized_tool_calls:
+                    for tc in (message.additional_kwargs.get("tool_calls") or []):
+                        fn = tc.get("function", {})
+                        raw_args = fn.get("arguments", "{}")
+                        try:
+                            parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+                        except (json.JSONDecodeError, TypeError):
+                            parsed_args = {}
+                        normalized_tool_calls.append(
+                            {
+                                "id": tc.get("id"),
+                                "name": fn.get("name"),
+                                "args": parsed_args if isinstance(parsed_args, dict) else {},
+                            }
+                        )
+
+                for tc in normalized_tool_calls:
                     tc_id = tc.get("id")
                     tc_name = tc.get("name")
                     if tc_id and tc_name:
@@ -343,21 +367,38 @@ class VertexAILLM(BaseChatModel):
                 if function_calls:
                     if not self.auto_execute_tools:
                         tool_calls = []
+                        openai_style_tool_calls = []
                         for idx, fc in enumerate(function_calls):
+                            call_id = f"call_{iteration}_{idx}"
                             tool_calls.append(
                                 {
-                                    "id": f"call_{iteration}_{idx}",
+                                    "id": call_id,
                                     "type": "tool_call",
                                     "name": fc["name"],
                                     "args": fc["args"],
                                 }
                             )
+                            openai_style_tool_calls.append(
+                                {
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": fc["name"],
+                                        "arguments": json.dumps(fc["args"]),
+                                    },
+                                }
+                            )
                         message = AIMessage(
                             content="\n".join(text_parts) if text_parts else "",
                             tool_calls=tool_calls,
+                            additional_kwargs={"tool_calls": openai_style_tool_calls},
                         )
                         return ChatResult(generations=[ChatGeneration(message=message)])
 
+                    logger.info(
+                        "auto_execute_tools=True; executing %d tool call(s) inside wrapper.",
+                        len(function_calls),
+                    )
                     # Add the model's response to contents using Part.from_dict()
                     model_parts = []
                     for fc in function_calls:
@@ -414,6 +455,7 @@ class VertexAILLM(BaseChatModel):
         """
         # Convert tools to Vertex format
         vertex_tools = self._convert_tools_to_vertex_format(list(tools))
+        auto_execute_tools = kwargs.get("auto_execute_tools", self.auto_execute_tools)
         
         # Create a new instance with the same config but with tools
         return self.__class__(
@@ -426,7 +468,7 @@ class VertexAILLM(BaseChatModel):
             vertex_tools=vertex_tools,
             response_schema=self.response_schema,
             response_mime_type=self.response_mime_type,
-            auto_execute_tools=self.auto_execute_tools,
+            auto_execute_tools=auto_execute_tools,
         )
 
     def with_structured_output(
@@ -462,7 +504,7 @@ class VertexAILLM(BaseChatModel):
             vertex_tools=self.vertex_tools,
             response_schema=json_schema,
             response_mime_type=kwargs.get("response_mime_type", "application/json"),
-            auto_execute_tools=self.auto_execute_tools,
+            auto_execute_tools=kwargs.get("auto_execute_tools", self.auto_execute_tools),
         )
 
     @property
