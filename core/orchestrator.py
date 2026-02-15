@@ -8,7 +8,7 @@ Reads agent skill.md definitions and builds a LangGraph StateGraph where:
 - Shared state flows through the graph
 
 Architecture:
-    User → Supervisor → [Researcher | Analyst | Writer | ...] → Supervisor → User
+    User -> Supervisor -> [Researcher | Analyst | Writer | ...] -> Supervisor -> User
 
 Usage:
     from core.orchestrator import build_multi_agent_graph
@@ -23,6 +23,7 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 import operator
 from typing import Annotated, Any, Sequence
 
@@ -38,6 +39,8 @@ from langgraph.prebuilt import create_react_agent
 
 from core.agent_loader import AgentSkill
 from core.chat_model import CitiVertexChat
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -63,8 +66,11 @@ def _make_agent_node(
     skill: AgentSkill,
     tool_registry: dict[str, Any],
 ):
-    """Create a LangGraph node for one agent."""
-    # Build LLM with agent-specific config
+    """Create a LangGraph node for one agent.
+
+    For agents WITH tools  -> uses create_react_agent (ReAct loop).
+    For agents WITHOUT tools -> direct LLM call with system prompt.
+    """
     llm = CitiVertexChat(
         model_name=skill.model,
         temperature=skill.temperature,
@@ -77,24 +83,42 @@ def _make_agent_node(
         if tool_name in tool_registry:
             agent_tools.append(tool_registry[tool_name])
         else:
-            raise ValueError(
-                f"Agent '{skill.name}' references unknown tool '{tool_name}'. "
-                f"Available tools: {list(tool_registry.keys())}"
+            logger.warning(
+                "Agent '%s' references unknown tool '%s'. Skipping. "
+                "Available: %s",
+                skill.name, tool_name, list(tool_registry.keys()),
             )
 
-    # Build the ReAct agent using LangGraph prebuilt
-    react_agent = create_react_agent(
-        llm,
-        tools=agent_tools,
-        prompt=skill.system_prompt,
-    )
+    if agent_tools:
+        # ---- Agent with tools: use ReAct agent ----
+        # create_react_agent in langgraph-prebuilt 1.0.x uses
+        # `state_modifier` to inject the system prompt.
+        react_agent = create_react_agent(
+            llm,
+            tools=agent_tools,
+            state_modifier=skill.system_prompt,
+        )
 
-    def node_fn(state: AgentState) -> dict:
-        """Run this agent on the current messages."""
-        result = react_agent.invoke({"messages": state["messages"]})
-        return {"messages": result["messages"]}
+        def tool_agent_node(state: AgentState) -> dict:
+            result = react_agent.invoke({"messages": state["messages"]})
+            # Only return NEW messages (not the full history) to avoid duplication
+            input_len = len(state["messages"])
+            new_messages = result["messages"][input_len:]
+            return {"messages": new_messages}
 
-    return node_fn
+        return tool_agent_node
+
+    else:
+        # ---- Agent without tools: direct LLM call ----
+        def simple_agent_node(state: AgentState) -> dict:
+            messages = [
+                SystemMessage(content=skill.system_prompt),
+                *state["messages"],
+            ]
+            response = llm.invoke(messages)
+            return {"messages": [response]}
+
+        return simple_agent_node
 
 
 def _make_supervisor_node(
@@ -104,7 +128,7 @@ def _make_supervisor_node(
 ):
     """Create the supervisor node that routes to specialist agents."""
     agents_list = "\n".join(
-        f"- **{name}**: {desc}" for name, desc in agent_descriptions.items()
+        f"- {name}: {desc}" for name, desc in agent_descriptions.items()
     )
 
     system_prompt = f"""You are a supervisor coordinating a team of specialist agents.
@@ -121,25 +145,37 @@ Rules:
 - You can route to the same agent multiple times if needed
 - Say FINISH only when the user's request is fully addressed
 - If an agent's output needs further processing, route to the next agent
-"""
+- Respond with a single word: one of [{', '.join(agent_names)}, FINISH]"""
 
     def supervisor_node(state: AgentState) -> dict:
-        messages = [SystemMessage(content=system_prompt)] + state["messages"]
+        messages = [
+            SystemMessage(content=system_prompt),
+            *state["messages"],
+        ]
         response = llm.invoke(messages)
-        next_agent = response.content.strip().lower()
+        raw = response.content.strip()
 
         # Normalize — handle variations like "FINISH", "finish", "Finish."
-        if "finish" in next_agent:
+        raw_lower = raw.lower().strip().rstrip(".")
+
+        if "finish" in raw_lower:
             next_agent = "FINISH"
         else:
             # Find best match from available agents
             matched = None
             for name in agent_names:
-                if name.lower() in next_agent:
+                if name.lower() in raw_lower:
                     matched = name
                     break
+            if not matched:
+                logger.warning(
+                    "Supervisor returned unrecognized agent: '%s'. "
+                    "Expected one of %s. Defaulting to FINISH.",
+                    raw, agent_names,
+                )
             next_agent = matched or "FINISH"
 
+        logger.info("Supervisor routed to: %s (raw: '%s')", next_agent, raw)
         return {"next_agent": next_agent}
 
     return supervisor_node
@@ -157,8 +193,8 @@ def build_multi_agent_graph(
     """Build the full multi-agent LangGraph from loaded skill definitions.
 
     Args:
-        agents: Dict of agent name → AgentSkill (from load_all_agents)
-        tool_registry: Dict of tool name → LangChain tool instance
+        agents: Dict of agent name -> AgentSkill (from load_all_agents)
+        tool_registry: Dict of tool name -> LangChain tool instance
         supervisor_model: Model to use for the supervisor
 
     Returns:
@@ -168,6 +204,9 @@ def build_multi_agent_graph(
     specialist_agents = {
         name: skill for name, skill in agents.items() if name != "supervisor"
     }
+
+    if not specialist_agents:
+        raise ValueError("No specialist agents found. Add .md files to the agents/ directory.")
 
     # Build the graph
     graph = StateGraph(AgentState)
@@ -238,8 +277,26 @@ def build_single_agent(
         if t in tool_registry
     ]
 
-    return create_react_agent(
-        llm,
-        tools=agent_tools,
-        prompt=skill.system_prompt,
-    )
+    if agent_tools:
+        return create_react_agent(
+            llm,
+            tools=agent_tools,
+            state_modifier=skill.system_prompt,
+        )
+    else:
+        # For agents without tools, wrap in a simple graph
+        from langgraph.graph import MessagesState
+
+        def call_llm(state: MessagesState):
+            messages = [
+                SystemMessage(content=skill.system_prompt),
+                *state["messages"],
+            ]
+            response = llm.invoke(messages)
+            return {"messages": [response]}
+
+        graph = StateGraph(MessagesState)
+        graph.add_node("llm", call_llm)
+        graph.set_entry_point("llm")
+        graph.add_edge("llm", END)
+        return graph.compile()

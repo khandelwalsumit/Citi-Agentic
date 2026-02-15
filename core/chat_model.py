@@ -26,12 +26,13 @@ from __future__ import annotations
 import uuid
 import json
 import logging
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
+    AIMessageChunk,
     BaseMessage,
     HumanMessage,
     SystemMessage,
@@ -56,13 +57,24 @@ logger = logging.getLogger(__name__)
 # Conversion helpers
 # ---------------------------------------------------------------------------
 
+def _clean_schema(schema: dict) -> dict:
+    """Remove keys that Vertex AI's FunctionDeclaration doesn't accept."""
+    blocked_keys = {"additionalProperties", "title", "$defs", "definitions"}
+    cleaned = {k: v for k, v in schema.items() if k not in blocked_keys}
+    # Recursively clean nested properties
+    if "properties" in cleaned:
+        cleaned["properties"] = {
+            k: _clean_schema(v) if isinstance(v, dict) else v
+            for k, v in cleaned["properties"].items()
+        }
+    return cleaned
+
+
 def _langchain_tool_to_vertex_fd(tool: dict) -> FunctionDeclaration:
     """Convert an OpenAI-format tool dict to a Vertex FunctionDeclaration."""
     func = tool["function"]
     params = func.get("parameters", {})
-    # Vertex AI doesn't accept 'additionalProperties' or 'title' at top level
-    params.pop("additionalProperties", None)
-    params.pop("title", None)
+    params = _clean_schema(params)
     return FunctionDeclaration(
         name=func["name"],
         description=func.get("description", ""),
@@ -95,15 +107,20 @@ def _convert_tools_to_vertex(tools: Sequence) -> list[VertexTool]:
 def _messages_to_vertex(
     messages: Sequence[BaseMessage],
 ) -> tuple[list[Content], str | None]:
-    """Convert LangChain messages to Vertex AI Content list + system instruction."""
+    """Convert LangChain messages to Vertex AI Content list + system instruction.
+
+    System messages are extracted separately. They will be injected as the
+    first user message prefixed with "[System Instructions]" for maximum
+    compatibility with R2D2 proxy endpoints that may not support the
+    system_instruction model parameter.
+    """
     contents: list[Content] = []
     system_parts: list[str] = []
 
     for msg in messages:
         if isinstance(msg, SystemMessage):
-            system_parts.append(
-                msg.content if isinstance(msg.content, str) else str(msg.content)
-            )
+            text = msg.content if isinstance(msg.content, str) else str(msg.content)
+            system_parts.append(text)
 
         elif isinstance(msg, HumanMessage):
             text = msg.content if isinstance(msg.content, str) else str(msg.content)
@@ -113,7 +130,7 @@ def _messages_to_vertex(
             parts: list[Part] = []
             if msg.content:
                 text = msg.content if isinstance(msg.content, str) else str(msg.content)
-                if text:
+                if text.strip():
                     parts.append(Part.from_text(text))
             # Tool calls from the model
             for tc in msg.tool_calls or []:
@@ -127,14 +144,18 @@ def _messages_to_vertex(
             # Tool results go back as function responses
             try:
                 response_data = json.loads(msg.content)
+                if not isinstance(response_data, dict):
+                    response_data = {"result": msg.content}
             except (json.JSONDecodeError, TypeError):
                 response_data = {"result": msg.content}
+
+            name = msg.name or getattr(msg, "tool_call_id", None) or "unknown_tool"
             contents.append(
                 Content(
                     role="user",
                     parts=[
                         Part.from_function_response(
-                            name=msg.name or msg.tool_call_id,
+                            name=name,
                             response=response_data,
                         )
                     ],
@@ -146,24 +167,64 @@ def _messages_to_vertex(
 
 
 def _parse_vertex_response(response) -> AIMessage:
-    """Convert Vertex AI response to LangChain AIMessage."""
-    candidate = response.candidates[0]
-    parts = candidate.content.parts
+    """Convert Vertex AI response to LangChain AIMessage.
 
+    Handles empty candidates, safety blocks, and malformed responses.
+    """
+    # ---- Handle missing or empty candidates ----
+    if not response.candidates:
+        # Check if blocked by safety filter
+        block_reason = ""
+        if hasattr(response, "prompt_feedback"):
+            pf = response.prompt_feedback
+            if hasattr(pf, "block_reason") and pf.block_reason:
+                block_reason = f" (block_reason: {pf.block_reason})"
+            if hasattr(pf, "block_reason_message") and pf.block_reason_message:
+                block_reason += f" {pf.block_reason_message}"
+
+        logger.warning("Vertex AI returned no candidates.%s", block_reason)
+
+        # Return a fallback AIMessage so LangGraph doesn't crash
+        return AIMessage(
+            content=f"[Model returned no response{block_reason}. "
+                    "The request may have been blocked by safety filters "
+                    "or the prompt may need adjustment.]",
+        )
+
+    candidate = response.candidates[0]
+
+    # Check finish reason for issues
+    finish_reason = getattr(candidate, "finish_reason", None)
+    if finish_reason and str(finish_reason) not in ("1", "STOP", "FinishReason.STOP"):
+        logger.info("Vertex AI finish_reason: %s", finish_reason)
+
+    # Handle candidate with no content
+    if not hasattr(candidate, "content") or not candidate.content:
+        return AIMessage(content="[Model returned empty content]")
+
+    if not candidate.content.parts:
+        return AIMessage(content="[Model returned no content parts]")
+
+    # ---- Parse parts ----
     text_parts: list[str] = []
     tool_calls: list[dict] = []
 
-    for part in parts:
+    for part in candidate.content.parts:
         # Check for function call
         fn_call = getattr(part, "function_call", None)
-        if fn_call and fn_call.name:
-            tool_calls.append(
-                {
-                    "name": fn_call.name,
-                    "args": dict(fn_call.args) if fn_call.args else {},
-                    "id": f"call_{uuid.uuid4().hex[:8]}",
-                }
-            )
+        if fn_call and getattr(fn_call, "name", None):
+            args = {}
+            if fn_call.args:
+                # fn_call.args can be a proto MapComposite or dict
+                try:
+                    args = dict(fn_call.args)
+                except Exception:
+                    args = json.loads(type(fn_call.args).to_json(fn_call.args))
+            tool_calls.append({
+                "name": fn_call.name,
+                "args": args,
+                "id": f"call_{uuid.uuid4().hex[:12]}",
+            })
         # Check for text
         elif hasattr(part, "text") and part.text:
             text_parts.append(part.text)
@@ -255,34 +316,55 @@ class CitiVertexChat(BaseChatModel):
         """Core generation — called by .invoke(), .stream(), agents, etc."""
         contents, system_instruction = _messages_to_vertex(messages)
 
-        # Build generation config
-        gen_config = GenerationConfig(
-            temperature=self.temperature,
-            max_output_tokens=self.max_output_tokens,
-            top_p=self.top_p,
-            top_k=self.top_k,
-            stop_sequences=stop or [],
-        )
-
-        # If there's a system instruction, create a model instance with it.
-        # GenerativeModel is lightweight so this is fine per-call.
+        # ---- Inject system prompt as first user message ----
+        # R2D2 proxy may not support system_instruction on GenerativeModel,
+        # so we prepend it as a clearly-labelled user message instead.
         if system_instruction:
-            model = GenerativeModel(
-                self.model_name,
-                system_instruction=system_instruction,
+            sys_content = Content(
+                role="user",
+                parts=[Part.from_text(
+                    f"[SYSTEM INSTRUCTIONS — follow these at all times]\n\n"
+                    f"{system_instruction}"
+                )],
             )
-        else:
-            model = self._model
+            # Need a model ack to keep user/model turn alternation valid
+            ack_content = Content(
+                role="model",
+                parts=[Part.from_text("Understood. I will follow these instructions.")],
+            )
+            contents = [sys_content, ack_content] + contents
 
-        # Tools passed via bind_tools()
-        vertex_tools = kwargs.get("tools", None)
+        # ---- Guard: must have at least one content ----
+        if not contents:
+            return ChatResult(generations=[ChatGeneration(
+                message=AIMessage(content="[No input messages provided]")
+            )])
 
+        # ---- Build generation config ----
+        gen_kwargs: dict[str, Any] = {
+            "temperature": self.temperature,
+            "max_output_tokens": self.max_output_tokens,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+        }
+        if stop:
+            gen_kwargs["stop_sequences"] = stop
+
+        gen_config = GenerationConfig(**gen_kwargs)
+
+        # ---- Build generate_content kwargs ----
+        call_kwargs: dict[str, Any] = {
+            "generation_config": gen_config,
+        }
+
+        # Only pass tools if we actually have them
+        vertex_tools = kwargs.get("tools")
+        if vertex_tools:
+            call_kwargs["tools"] = vertex_tools
+
+        # ---- Call Vertex AI ----
         try:
-            response = model.generate_content(
-                contents,
-                generation_config=gen_config,
-                tools=vertex_tools,
-            )
+            response = self._model.generate_content(contents, **call_kwargs)
         except Exception as e:
             logger.error("Vertex AI generate_content failed: %s", e)
             raise
