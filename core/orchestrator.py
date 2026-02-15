@@ -51,12 +51,54 @@ class AgentState(TypedDict):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _summarize_messages(messages: list[BaseMessage], max_len: int = 300) -> str:
+def _to_message(m) -> BaseMessage:
+    """Convert any message-like object to a proper LangChain Message.
+
+    Handles tuples ("role", "content"), dicts, strings, and passthrough
+    for existing Message objects.
+    """
+    if isinstance(m, BaseMessage):
+        return m
+    if isinstance(m, tuple) and len(m) == 2:
+        role, content = m
+        if role in ("user", "human"):
+            return HumanMessage(content=content)
+        elif role in ("assistant", "ai", "model"):
+            return AIMessage(content=content)
+        elif role == "system":
+            return SystemMessage(content=content)
+        return HumanMessage(content=content)
+    if isinstance(m, dict):
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if role in ("user", "human"):
+            return HumanMessage(content=content)
+        elif role in ("assistant", "ai"):
+            return AIMessage(content=content)
+        elif role == "system":
+            return SystemMessage(content=content)
+        return HumanMessage(content=content)
+    if isinstance(m, str):
+        return HumanMessage(content=m)
+    return HumanMessage(content=str(m))
+
+
+def _ensure_messages(messages: list) -> list[BaseMessage]:
+    """Convert a list of mixed message formats to proper LangChain Messages."""
+    return [_to_message(m) for m in messages]
+
+
+def _summarize_messages(messages: list, max_len: int = 300) -> str:
     """Create a short summary of a message list for tracing."""
     parts = []
-    for m in messages[-3:]:  # last 3 messages
-        role = type(m).__name__.replace("Message", "")
-        content = m.content if isinstance(m.content, str) else str(m.content)
+    for m in messages[-3:]:
+        if isinstance(m, BaseMessage):
+            role = type(m).__name__.replace("Message", "")
+            content = m.content if isinstance(m.content, str) else str(m.content)
+        elif isinstance(m, tuple):
+            role, content = m[0], str(m[1])
+        else:
+            role, content = "?", str(m)
         content = content[:100].replace("\n", " ")
         if hasattr(m, "tool_calls") and m.tool_calls:
             tools = ", ".join(tc["name"] for tc in m.tool_calls)
@@ -103,14 +145,15 @@ def _make_agent_node(
         system_msg = SystemMessage(content=skill.system_prompt)
 
         def tool_agent_node(state: AgentState) -> dict:
+            msgs = _ensure_messages(state["messages"])
             if tracer:
-                tracer.start(skill.name, _summarize_messages(state["messages"]))
+                tracer.start(skill.name, _summarize_messages(msgs))
             try:
                 # Prepend system prompt — CitiVertexChat._generate handles it
-                input_msgs = [system_msg] + state["messages"]
+                input_msgs = [system_msg] + msgs
                 result = react_agent.invoke({"messages": input_msgs})
                 # +1 for the system_msg we prepended
-                input_len = len(state["messages"]) + 1
+                input_len = len(msgs) + 1
                 new_messages = result["messages"][input_len:]
 
                 # Log tool calls to tracer
@@ -139,12 +182,13 @@ def _make_agent_node(
 
     else:
         def simple_agent_node(state: AgentState) -> dict:
+            msgs = _ensure_messages(state["messages"])
             if tracer:
-                tracer.start(skill.name, _summarize_messages(state["messages"]))
+                tracer.start(skill.name, _summarize_messages(msgs))
             try:
                 messages = [
                     SystemMessage(content=skill.system_prompt),
-                    *state["messages"],
+                    *msgs,
                 ]
                 response = llm.invoke(messages)
                 content = response.content if isinstance(response.content, str) else str(response.content)
@@ -187,12 +231,13 @@ Rules:
 - Respond with a single word: one of [{', '.join(agent_names)}, FINISH]"""
 
     def supervisor_node(state: AgentState) -> dict:
+        msgs = _ensure_messages(state["messages"])
         if tracer:
-            tracer.start("supervisor", _summarize_messages(state["messages"]))
+            tracer.start("supervisor", _summarize_messages(msgs))
 
         messages = [
             SystemMessage(content=system_prompt),
-            *state["messages"],
+            *msgs,
         ]
         response = llm.invoke(messages)
         raw = response.content.strip()
@@ -324,11 +369,12 @@ def build_single_agent(
         from langgraph.graph import MessagesState as _MS
 
         def call_react(state: _MS):
+            msgs = _ensure_messages(state["messages"])
             result = react_agent.invoke({
-                "messages": [sys_msg] + state["messages"],
+                "messages": [sys_msg] + msgs,
             })
             # Strip the prepended system msg from output
-            return {"messages": result["messages"][len(state["messages"]) + 1:]}
+            return {"messages": result["messages"][len(msgs) + 1:]}
 
         g = StateGraph(_MS)
         g.add_node("agent", call_react)
@@ -339,9 +385,10 @@ def build_single_agent(
         from langgraph.graph import MessagesState
 
         def call_llm(state: MessagesState):
+            msgs = _ensure_messages(state["messages"])
             messages = [
                 SystemMessage(content=skill.system_prompt),
-                *state["messages"],
+                *msgs,
             ]
             response = llm.invoke(messages)
             return {"messages": [response]}

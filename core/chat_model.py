@@ -118,6 +118,22 @@ def _messages_to_vertex(
     system_parts: list[str] = []
 
     for msg in messages:
+        # Handle tuples like ("user", "hello") that LangGraph may pass
+        if isinstance(msg, (tuple, list)) and len(msg) == 2:
+            role, text = msg
+            text = str(text)
+            if role in ("system",):
+                system_parts.append(text)
+            elif role in ("assistant", "ai", "model"):
+                contents.append(Content(role="model", parts=[Part.from_text(text)]))
+            else:
+                contents.append(Content(role="user", parts=[Part.from_text(text)]))
+            continue
+
+        if isinstance(msg, str):
+            contents.append(Content(role="user", parts=[Part.from_text(msg)]))
+            continue
+
         if isinstance(msg, SystemMessage):
             text = msg.content if isinstance(msg.content, str) else str(msg.content)
             system_parts.append(text)
