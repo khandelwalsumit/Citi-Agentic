@@ -1,0 +1,11 @@
+google-cloud-aiplatform>=1.71.0
+vertexai>=1.71.0
+langchain>=1.2.0
+langchain-core>=1.2.0
+langgraph>=1.0.0
+langgraph-prebuilt>=1.0.0
+pydantic>=2.0.0
+requests>=2.30.0
+python-dotenv>=1.0.0
+PyYAML>=6.0
+google-auth>=2.0.0
