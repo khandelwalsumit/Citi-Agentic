@@ -1,20 +1,25 @@
-
-START
+## 🔄 The Full Flow
+```
+"top costco signon issues"
   ↓
-filter_node      → tool loop: get valid filters → filter data → raw granular themes
+filter_node          → filters data, loads full dataset
   ↓
-planner_node     → reviews ALL themes, picks top 3-8, orders by volume, notes patterns
+hierarchy_navigator  → adaptive drill-down
+  ├─ Broad: "Authentication Issues" (vol: 3,200) → TOO BIG, drill down
+  ├─ Intermediate: "OTP Failures" (vol: 1,400) → TOO BIG, drill down
+  │   ├─ Granular: "OTP Not Received" (vol: 847) ✅
+  │   └─ Granular: "OTP Expired Before Entry" (vol: 553) ✅
+  └─ Intermediate: "Password Reset Failures" (vol: 180) ✅ (under threshold)
+  
+  Output: 3 themes ready for analysis (2 granular, 1 intermediate)
   ↓
-executor_node  ←─────────────────────────────────────────┐
-  ↓                                                       │
-  → analyses ONE theme (digital_failure + root_cause      │
-    + actionable_fix + fix_owner + evidence)              │
-  ↓                                                       │
-should_continue_executing ──── more themes? ─────────────┘
-  ↓ all done
-aggregator_node  → combines all results → cross-theme patterns → top 3 actions
+theme_router         → assigns each to auth_specialist
   ↓
-END
+[parallel execution] → 3 auth specialists run simultaneously
+  ↓
+prioritizer          → computes priority_score for each
+  ↓
+report_generator     → final ranked report with priority matrix
 
 ```python
 
