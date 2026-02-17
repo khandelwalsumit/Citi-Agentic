@@ -1,3 +1,21 @@
+
+START
+  ↓
+filter_node      → tool loop: get valid filters → filter data → raw granular themes
+  ↓
+planner_node     → reviews ALL themes, picks top 3-8, orders by volume, notes patterns
+  ↓
+executor_node  ←─────────────────────────────────────────┐
+  ↓                                                       │
+  → analyses ONE theme (digital_failure + root_cause      │
+    + actionable_fix + fix_owner + evidence)              │
+  ↓                                                       │
+should_continue_executing ──── more themes? ─────────────┘
+  ↓ all done
+aggregator_node  → combines all results → cross-theme patterns → top 3 actions
+  ↓
+END
+
 ```python
 
 """
